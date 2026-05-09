@@ -24,6 +24,14 @@ using boost::asio::ip::tcp;
 using boost::property_tree::ptree;
 
 namespace {
+std::mutex g_log_mutex;
+
+void LogLine(const std::string& line)
+{
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    std::cout << line << std::endl;
+}
+
 constexpr unsigned char BYZE_RANDOMX_KEY_V1[] = {
     0x48, 0x45, 0x52, 0x4D, 0x48, 0x65, 0x72, 0x6D, 0x65, 0x73, 0x20, 0x43, 0x6F, 0x69, 0x6E, 0x20,
     0x52, 0x61, 0x6E, 0x64, 0x6F, 0x6D, 0x58, 0x20, 0x4E, 0x65, 0x74, 0x77, 0x6F, 0x72, 0x6B, 0x00};
@@ -46,6 +54,12 @@ struct Job {
     uint64_t coinbase_value{0};
     uint32_t height{0};
     std::array<uint8_t, 32> target{};
+    std::array<uint8_t, 32> target_be{};
+};
+
+struct ShareSubmitResult {
+    bool accepted{false};
+    std::string reason;
 };
 
 std::vector<uint8_t> HexToBytes(const std::string& hex)
@@ -99,16 +113,26 @@ std::vector<uint8_t> Sha256d(const std::vector<uint8_t>& data)
     return h2;
 }
 
-std::vector<uint8_t> BuildCoinbaseTx(const Job& job, const std::string& worker)
-{
-    std::vector<uint8_t> tx;
-    WriteLE32(tx, 2); // version
-    tx.push_back(0x00); // marker
-    tx.push_back(0x01); // flag
+struct CoinbaseTx {
+    std::vector<uint8_t> with_witness;
+    std::vector<uint8_t> no_witness;
+};
 
-    WriteVarInt(tx, 1); // vin count
-    tx.insert(tx.end(), 32, 0x00);
-    WriteLE32(tx, 0xffffffff);
+CoinbaseTx BuildCoinbaseTx(const Job& job, const std::string& worker)
+{
+    CoinbaseTx out;
+    std::vector<uint8_t>& txw = out.with_witness;
+    std::vector<uint8_t>& txnw = out.no_witness;
+    WriteLE32(txw, 2);
+    WriteLE32(txnw, 2);
+    txw.push_back(0x00); // marker
+    txw.push_back(0x01); // flag
+    WriteVarInt(txw, 1);
+    WriteVarInt(txnw, 1);
+    txw.insert(txw.end(), 32, 0x00);
+    txnw.insert(txnw.end(), 32, 0x00);
+    WriteLE32(txw, 0xffffffff);
+    WriteLE32(txnw, 0xffffffff);
 
     std::vector<uint8_t> scriptsig;
     scriptsig.push_back(0x03);
@@ -118,21 +142,50 @@ std::vector<uint8_t> BuildCoinbaseTx(const Job& job, const std::string& worker)
     const std::string tag = "/byze-miner/" + worker + "/";
     scriptsig.push_back(static_cast<uint8_t>(std::min<size_t>(tag.size(), 60)));
     scriptsig.insert(scriptsig.end(), tag.begin(), tag.begin() + std::min<size_t>(tag.size(), 60));
-    WriteVarInt(tx, scriptsig.size());
-    tx.insert(tx.end(), scriptsig.begin(), scriptsig.end());
-    WriteLE32(tx, 0xffffffff);
+    WriteVarInt(txw, scriptsig.size());
+    WriteVarInt(txnw, scriptsig.size());
+    txw.insert(txw.end(), scriptsig.begin(), scriptsig.end());
+    txnw.insert(txnw.end(), scriptsig.begin(), scriptsig.end());
+    WriteLE32(txw, 0xffffffff);
+    WriteLE32(txnw, 0xffffffff);
 
-    WriteVarInt(tx, 1); // vout count
-    WriteLE64(tx, job.coinbase_value);
-    tx.push_back(0x01); // script len
-    tx.push_back(0x51); // OP_TRUE fallback
+    // Build witness commitment according to BIP141:
+    // witness_root (coinbase-only) = 32 zero bytes, reserved value = 32 zero bytes
+    std::vector<uint8_t> witness_preimage(64, 0x00);
+    const std::vector<uint8_t> witness_commitment = Sha256d(witness_preimage);
 
-    WriteVarInt(tx, 1); // witness for coinbase input
-    WriteVarInt(tx, 32);
-    tx.insert(tx.end(), 32, 0x00);
+    WriteVarInt(txw, 2);
+    WriteVarInt(txnw, 2);
+    WriteLE64(txw, job.coinbase_value);
+    WriteLE64(txnw, job.coinbase_value);
+    txw.push_back(0x01);
+    txnw.push_back(0x01);
+    txw.push_back(0x51);
+    txnw.push_back(0x51);
 
-    WriteLE32(tx, 0); // locktime
-    return tx;
+    // OP_RETURN 0x24 aa21a9ed <32-byte-commitment>
+    WriteLE64(txw, 0);
+    WriteLE64(txnw, 0);
+    std::vector<uint8_t> wscript;
+    wscript.push_back(0x6a);
+    wscript.push_back(0x24);
+    wscript.push_back(0xaa);
+    wscript.push_back(0x21);
+    wscript.push_back(0xa9);
+    wscript.push_back(0xed);
+    wscript.insert(wscript.end(), witness_commitment.begin(), witness_commitment.end());
+    WriteVarInt(txw, wscript.size());
+    WriteVarInt(txnw, wscript.size());
+    txw.insert(txw.end(), wscript.begin(), wscript.end());
+    txnw.insert(txnw.end(), wscript.begin(), wscript.end());
+
+    WriteVarInt(txw, 1);
+    WriteVarInt(txw, 32);
+    txw.insert(txw.end(), 32, 0x00);
+
+    WriteLE32(txw, 0);
+    WriteLE32(txnw, 0);
+    return out;
 }
 
 std::array<uint8_t, 32> ToArray32LE(const std::string& hex_be)
@@ -149,6 +202,18 @@ bool HashMeetsTargetLE(const uint8_t hash_le[32], const std::array<uint8_t, 32>&
     for (int i = 31; i >= 0; --i) {
         if (hash_le[i] < target_le[i]) return true;
         if (hash_le[i] > target_le[i]) return false;
+    }
+    return true;
+}
+
+bool HashMeetsTargetBE(const uint8_t hash_le[32], const std::array<uint8_t, 32>& target_be)
+{
+    // Convert hash bytes to big-endian view for direct lexical numeric compare.
+    for (size_t i = 0; i < 32; ++i) {
+        const uint8_t hb = hash_le[31 - i];
+        const uint8_t tb = target_be[i];
+        if (hb < tb) return true;
+        if (hb > tb) return false;
     }
     return true;
 }
@@ -172,19 +237,19 @@ struct MinerState {
     std::atomic<uint64_t> rejected{0};
 };
 
-std::vector<uint8_t> BuildBlock(const Job& job, uint32_t nonce, const std::vector<uint8_t>& coinbase_tx)
+std::vector<uint8_t> BuildBlock(const Job& job, uint32_t nonce, const CoinbaseTx& coinbase)
 {
     std::vector<uint8_t> block;
     block.reserve(2048);
     WriteLE32(block, job.version);
     block.insert(block.end(), job.prevhash.begin(), job.prevhash.end());
-    auto cb_hash = Sha256d(coinbase_tx);
+    auto cb_hash = Sha256d(coinbase.no_witness);
     block.insert(block.end(), cb_hash.begin(), cb_hash.end()); // merkle root, only coinbase
     WriteLE32(block, job.curtime);
     WriteLE32(block, job.bits);
     WriteLE32(block, nonce);
     WriteVarInt(block, 1);
-    block.insert(block.end(), coinbase_tx.begin(), coinbase_tx.end());
+    block.insert(block.end(), coinbase.with_witness.begin(), coinbase.with_witness.end());
     return block;
 }
 
@@ -271,6 +336,10 @@ int main(int argc, char** argv)
                 j.coinbase_value = obj.get<uint64_t>("template.coinbasevalue");
                 j.height = obj.get<uint32_t>("height");
                 j.target = ToArray32LE(obj.get<std::string>("target"));
+                auto tbytes = HexToBytes(obj.get<std::string>("target"));
+                if (tbytes.size() == 32) {
+                    for (size_t k = 0; k < 32; ++k) j.target_be[k] = tbytes[k];
+                }
                 {
                     std::lock_guard<std::mutex> g(state.mtx);
                     state.job = j;
@@ -298,25 +367,34 @@ int main(int argc, char** argv)
                     job = *state.job;
                 }
                 auto coinbase = BuildCoinbaseTx(job, cfg.worker);
+                LogLine("step1:block-candidate-built job=" + job.id + " height=" + std::to_string(job.height));
                 for (uint32_t nonce = static_cast<uint32_t>(t); state.running.load(); nonce += static_cast<uint32_t>(cfg.threads)) {
                     std::array<uint8_t, 80> hdr{};
                     std::memcpy(hdr.data(), &job.version, 4);
                     std::memcpy(hdr.data() + 4, job.prevhash.data(), 32);
-                    auto cb_hash = Sha256d(coinbase);
+                    auto cb_hash = Sha256d(coinbase.no_witness);
                     std::memcpy(hdr.data() + 36, cb_hash.data(), 32);
                     std::memcpy(hdr.data() + 68, &job.curtime, 4);
                     std::memcpy(hdr.data() + 72, &job.bits, 4);
                     std::memcpy(hdr.data() + 76, &nonce, 4);
                     uint8_t hash[32];
                     randomx_calculate_hash(vms[t], hdr.data(), hdr.size(), hash);
+                    if ((nonce & 0x3ffff) == 0) {
+                        LogLine("step2:randomx-hashing job=" + job.id + " thread=" + std::to_string(t));
+                    }
                     state.hashes.fetch_add(1, std::memory_order_relaxed);
-                    if (HashMeetsTargetLE(hash, job.target)) {
+                    const bool hit_le = HashMeetsTargetLE(hash, job.target);
+                    const bool hit_be = HashMeetsTargetBE(hash, job.target_be);
+                    if (hit_le || hit_be) {
+                        LogLine("step3:valid-share-detected job=" + job.id + " nonce=" + std::to_string(nonce) +
+                                " mode=" + (hit_le ? std::string("le") : std::string("be")));
                         auto block = BuildBlock(job, nonce, coinbase);
                         auto block_hex = BytesToHex(block);
                         const uint32_t id = submit_id.fetch_add(1);
                         std::ostringstream req;
                         req << "{\"id\":" << id << ",\"method\":\"mining.submit\",\"params\":[\""
                             << cfg.wallet << "." << cfg.worker << "\",\"" << block_hex << "\"]}";
+                        LogLine("step4:submit-mining-submit id=" + std::to_string(id));
                         send_json(req.str());
                     }
                     if ((nonce & 0x3fff) == 0) {
@@ -335,8 +413,8 @@ int main(int argc, char** argv)
             uint64_t now = state.hashes.load();
             uint64_t hps = now - last;
             last = now;
-            std::cout << "hashrate=" << hps << " H/s accepted=" << state.accepted.load()
-                      << " rejected=" << state.rejected.load() << std::endl;
+            LogLine("hashrate=" + std::to_string(hps) + " H/s accepted=" + std::to_string(state.accepted.load()) +
+                    " rejected=" + std::to_string(state.rejected.load()));
         }
     });
 

@@ -35,3 +35,25 @@ cmake --build build -j
   --worker rig01 \
   --threads 4
 ```
+
+## Architecture Proof Milestone (No Qt)
+
+Use the proof script to validate this exact pipeline end-to-end:
+
+1. build valid block candidate  
+2. RandomX hash block header  
+3. detect valid share  
+4. `mining.submit`  
+5. sidecar accepts  
+6. daemon `submitblock` path advances chain
+
+```bash
+./scripts/prove_architecture.sh \
+  127.0.0.1:3333 \
+  YOUR_WALLET_ADDRESS \
+  rig01 \
+  2 \
+  /home/byze/byze/src/byze-cli
+```
+
+The script prints step markers from miner stdout and verifies block height increased.
