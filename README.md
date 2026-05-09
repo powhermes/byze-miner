@@ -17,14 +17,27 @@ Standalone CPU miner for Byze pool mining (no XMRig dependency).
   - hashrate
   - accepted shares
   - rejected shares
-- Uses Byze RandomX key/mode and links RandomX from the Byze source tree.
+- Uses the Byze RandomX key; **RandomX is vendored** under `third_party/randomx` (upstream Monero RandomX). No Byze daemon source checkout is required.
 
 ## Build
 
+**Debian / Ubuntu (installs dependencies, then builds):**
+
 ```bash
-cmake -S . -B build -DBYZE_SOURCE_DIR=/home/byze/byze
-cmake --build build -j
+git clone <byze-miner-url>
+cd byze-miner
+chmod +x scripts/bootstrap-debian.sh
+./scripts/bootstrap-debian.sh
+# -> ./build/byze-miner
 ```
+
+**Already have build tools:** configure Boost, OpenSSL, CMake 3.20+, and a C++20 compiler, then:
+
+```bash
+./scripts/build.sh
+```
+
+Pass extra CMake flags after either script (they are forwarded to the configure step), e.g. `./scripts/bootstrap-debian.sh -DCMAKE_BUILD_TYPE=Release`.
 
 ## Run
 

@@ -19,8 +19,7 @@ MINER_BIN="${ROOT_DIR}/build/byze-miner"
 
 if [[ ! -x "${MINER_BIN}" ]]; then
   echo "Building byze-miner..."
-  cmake -S "${ROOT_DIR}" -B "${ROOT_DIR}/build" -DBYZE_SOURCE_DIR=/home/byze/byze >/dev/null
-  cmake --build "${ROOT_DIR}/build" -j >/dev/null
+  "${ROOT_DIR}/scripts/build.sh" >/dev/null
 fi
 
 BEFORE="$(${BYZECLI} getblockcount)"
