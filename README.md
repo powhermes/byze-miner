@@ -13,10 +13,12 @@ Standalone CPU miner for Byze pool mining (no XMRig dependency).
   - `--wallet <address>`
   - `--worker <name>`
   - `--threads <count>`
+  - `--pool-difficulty N` (optional): fix local share difficulty multiplier if the pool does not send `mining.set_difficulty`
 - Live stats:
   - hashrate
   - accepted shares
   - rejected shares
+- Submits when RandomX hash meets **pool share target** from `mining.set_difficulty` (easier than a full block); still submits full block hex for both pool shares and block solutions (pool validates and forwards blocks only when network target is met).
 - Uses the Byze RandomX key; **RandomX is vendored** under `third_party/randomx` (upstream Monero RandomX). No Byze daemon source checkout is required.
 
 ## Build

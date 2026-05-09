@@ -1,6 +1,7 @@
 #include <randomx.h>
 
 #include <boost/asio.hpp>
+#include <boost/multiprecision/cpp_int.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 
@@ -42,6 +43,8 @@ struct Config {
     std::string wallet;
     std::string worker;
     int threads{0};
+    /** 0 = use pool mining.set_difficulty only; else override until server sends difficulty. */
+    uint32_t pool_difficulty_override{0};
 };
 
 struct Job {
@@ -218,6 +221,28 @@ bool HashMeetsTargetBE(const uint8_t hash_le[32], const std::array<uint8_t, 32>&
     return true;
 }
 
+/** Pool share target: min(network_target_uint256 * mult, 2^256-1), same as stratum-adapter pow.share_targets. */
+void ShareTargetsFromNetwork(const std::array<uint8_t, 32>& net_target_le, uint32_t mult,
+    std::array<uint8_t, 32>& share_le, std::array<uint8_t, 32>& share_be)
+{
+    if (mult < 1) mult = 1;
+    using boost::multiprecision::cpp_int;
+    cpp_int n = 0;
+    for (size_t i = 0; i < 32; ++i)
+        n += cpp_int(net_target_le[i]) << static_cast<unsigned>(8 * i);
+    cpp_int st = n * cpp_int(mult);
+    const cpp_int cap = (cpp_int(1) << 256) - 1;
+    if (st > cap) st = cap;
+    cpp_int x = st;
+    for (size_t i = 0; i < 32; ++i) {
+        share_le[i] = static_cast<uint8_t>((x & 0xff).convert_to<unsigned>());
+        x >>= 8;
+    }
+    for (size_t i = 0; i < 32; ++i) {
+        share_be[i] = static_cast<uint8_t>(((st >> static_cast<unsigned>(8 * (31 - i))) & 0xff).convert_to<unsigned>());
+    }
+}
+
 uint32_t ParseBits(const std::string& bits_hex)
 {
     uint32_t v{0};
@@ -235,6 +260,8 @@ struct MinerState {
     std::atomic<uint64_t> hashes{0};
     std::atomic<uint64_t> accepted{0};
     std::atomic<uint64_t> rejected{0};
+    /** Stratum mining.set_difficulty (truncated to uint32, min 1). Default 1024 matches typical pool. */
+    std::atomic<uint32_t> pool_difficulty{1024};
 };
 
 std::vector<uint8_t> BuildBlock(const Job& job, uint32_t nonce, const CoinbaseTx& coinbase)
@@ -269,9 +296,10 @@ int main(int argc, char** argv)
         } else if (a == "--wallet" && i + 1 < argc) cfg.wallet = argv[++i];
         else if (a == "--worker" && i + 1 < argc) cfg.worker = argv[++i];
         else if (a == "--threads" && i + 1 < argc) cfg.threads = std::stoi(argv[++i]);
+        else if (a == "--pool-difficulty" && i + 1 < argc) cfg.pool_difficulty_override = static_cast<uint32_t>(std::stoul(argv[++i]));
     }
     if (cfg.host.empty() || cfg.wallet.empty()) {
-        std::cerr << "Usage: byze-miner --pool host:port --wallet ADDRESS [--worker name] [--threads N]\n";
+        std::cerr << "Usage: byze-miner --pool host:port --wallet ADDRESS [--worker name] [--threads N] [--pool-difficulty N]\n";
         return 1;
     }
     if (cfg.worker.empty()) cfg.worker = "cpu0";
@@ -293,12 +321,15 @@ int main(int argc, char** argv)
     }
 
     MinerState state;
+    if (cfg.pool_difficulty_override >= 1) state.pool_difficulty.store(cfg.pool_difficulty_override);
     boost::asio::io_context io;
     tcp::resolver resolver(io);
     tcp::socket socket(io);
     boost::asio::connect(socket, resolver.resolve(cfg.host, cfg.port));
 
+    std::mutex send_mtx;
     auto send_json = [&](const std::string& s) {
+        std::lock_guard<std::mutex> lk(send_mtx);
         boost::asio::write(socket, boost::asio::buffer(s + "\n"));
     };
 
@@ -319,6 +350,22 @@ int main(int argc, char** argv)
             ptree root;
             try { read_json(js, root); } catch (...) { continue; }
 
+            if (root.get_optional<std::string>("method") && root.get<std::string>("method") == "mining.set_difficulty") {
+                if (!cfg.pool_difficulty_override) {
+                    try {
+                        auto params = root.get_child("params");
+                        auto pit = params.begin();
+                        if (pit != params.end()) {
+                            const double d = pit->second.get_value<double>(1024.0);
+                            uint32_t m = static_cast<uint32_t>(d);
+                            if (m < 1) m = 1;
+                            state.pool_difficulty.store(m);
+                        }
+                    } catch (...) {
+                    }
+                }
+                continue;
+            }
             if (root.get_optional<std::string>("method") && root.get<std::string>("method") == "mining.notify") {
                 auto params = root.get_child("params");
                 Job j;
@@ -383,11 +430,16 @@ int main(int argc, char** argv)
                         LogLine("step2:randomx-hashing job=" + job.id + " thread=" + std::to_string(t));
                     }
                     state.hashes.fetch_add(1, std::memory_order_relaxed);
-                    const bool hit_le = HashMeetsTargetLE(hash, job.target);
-                    const bool hit_be = HashMeetsTargetBE(hash, job.target_be);
-                    if (hit_le || hit_be) {
-                        LogLine("step3:valid-share-detected job=" + job.id + " nonce=" + std::to_string(nonce) +
-                                " mode=" + (hit_le ? std::string("le") : std::string("be")));
+                    const uint32_t pd = state.pool_difficulty.load(std::memory_order_relaxed);
+                    std::array<uint8_t, 32> share_le{};
+                    std::array<uint8_t, 32> share_be{};
+                    ShareTargetsFromNetwork(job.target, pd, share_le, share_be);
+                    const bool hit_share = HashMeetsTargetLE(hash, share_le) || HashMeetsTargetBE(hash, share_be);
+                    const bool hit_block = HashMeetsTargetLE(hash, job.target) || HashMeetsTargetBE(hash, job.target_be);
+                    if (hit_share) {
+                        LogLine(std::string("step3:valid-share-detected job=") + job.id + " nonce=" + std::to_string(nonce) +
+                                (hit_block ? " kind=block" : " kind=pool_share") +
+                                " pdiff=" + std::to_string(pd));
                         auto block = BuildBlock(job, nonce, coinbase);
                         auto block_hex = BytesToHex(block);
                         const uint32_t id = submit_id.fetch_add(1);
