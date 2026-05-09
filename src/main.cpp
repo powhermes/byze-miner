@@ -33,6 +33,52 @@ void LogLine(const std::string& line)
     std::cout << line << std::endl;
 }
 
+/** Boost.PropertyTree JSON often stores numbers/bools as strings; normalize id/result. */
+std::optional<int64_t> PtreeJsonInt(const ptree& root, const char* key)
+{
+    const auto opt = root.get_child_optional(key);
+    if (!opt) return std::nullopt;
+    const ptree& ch = *opt;
+    try {
+        return ch.get_value<int64_t>();
+    } catch (...) {
+    }
+    try {
+        const std::string s = ch.data();
+        if (!s.empty()) return std::stoll(s);
+    } catch (...) {
+    }
+    return std::nullopt;
+}
+
+bool PtreeJsonResultOk(const ptree& root)
+{
+    const auto opt = root.get_child_optional("result");
+    if (!opt) return false;
+    const ptree& r = *opt;
+    const std::string d = r.data();
+    if (d == "true" || d == "1") return true;
+    if (d == "false" || d == "0") return false;
+    if (d.empty() && r.empty()) return false;
+    try {
+        return r.get_value<bool>(false);
+    } catch (...) {
+        return false;
+    }
+}
+
+bool PtreeJsonErrorPresent(const ptree& root)
+{
+    const auto opt = root.get_child_optional("error");
+    if (!opt) return false;
+    const ptree& e = *opt;
+    if (e.empty()) {
+        const std::string d = e.data();
+        return !(d.empty() || d == "null");
+    }
+    return true;
+}
+
 constexpr unsigned char BYZE_RANDOMX_KEY_V1[] = {
     0x48, 0x45, 0x52, 0x4D, 0x48, 0x65, 0x72, 0x6D, 0x65, 0x73, 0x20, 0x43, 0x6F, 0x69, 0x6E, 0x20,
     0x52, 0x61, 0x6E, 0x64, 0x6F, 0x6D, 0x58, 0x20, 0x4E, 0x65, 0x74, 0x77, 0x6F, 0x72, 0x6B, 0x00};
@@ -392,10 +438,13 @@ int main(int argc, char** argv)
                     state.job = j;
                 }
                 state.has_job.store(true);
-            } else if (root.get_optional<int>("id") && root.get<int>("id") >= 1000) {
-                bool ok = root.get<bool>("result", false);
-                if (ok) state.accepted.fetch_add(1);
-                else state.rejected.fetch_add(1);
+            } else {
+                const auto rid = PtreeJsonInt(root, "id");
+                if (rid && *rid >= 1000) {
+                    const bool ok = PtreeJsonResultOk(root) && !PtreeJsonErrorPresent(root);
+                    if (ok) state.accepted.fetch_add(1);
+                    else state.rejected.fetch_add(1);
+                }
             }
         }
         state.running.store(false);
