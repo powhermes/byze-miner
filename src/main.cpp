@@ -486,15 +486,25 @@ int main(int argc, char** argv)
                     const bool hit_share = HashMeetsTargetLE(hash, share_le) || HashMeetsTargetBE(hash, share_be);
                     const bool hit_block = HashMeetsTargetLE(hash, job.target) || HashMeetsTargetBE(hash, job.target_be);
                     if (hit_share) {
+                        std::vector<uint8_t> hv(hash, hash + 32);
+                        std::vector<uint8_t> hv_rev(hv.rbegin(), hv.rend());
+                        std::vector<uint8_t> st_le(share_le.begin(), share_le.end());
+                        std::vector<uint8_t> st_be(share_be.begin(), share_be.end());
+                        std::vector<uint8_t> nt_be(job.target_be.begin(), job.target_be.end());
                         LogLine(std::string("step3:valid-share-detected job=") + job.id + " nonce=" + std::to_string(nonce) +
                                 (hit_block ? " kind=block" : " kind=pool_share") +
-                                " pdiff=" + std::to_string(pd));
+                                " pdiff=" + std::to_string(pd) +
+                                " hash=" + BytesToHex(hv) +
+                                " hash_rev=" + BytesToHex(hv_rev) +
+                                " share_le=" + BytesToHex(st_le) +
+                                " share_be=" + BytesToHex(st_be) +
+                                " net_be=" + BytesToHex(nt_be));
                         auto block = BuildBlock(job, nonce, coinbase);
                         auto block_hex = BytesToHex(block);
                         const uint32_t id = submit_id.fetch_add(1);
                         std::ostringstream req;
                         req << "{\"id\":" << id << ",\"method\":\"mining.submit\",\"params\":[\""
-                            << cfg.wallet << "." << cfg.worker << "\",\"" << block_hex << "\"]}";
+                            << cfg.wallet << "." << cfg.worker << "\",\"" << block_hex << "\",\"" << job.id << "\"]}";
                         LogLine("step4:submit-mining-submit id=" + std::to_string(id));
                         send_json(req.str());
                     }
