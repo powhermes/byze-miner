@@ -501,11 +501,20 @@ int main(int argc, char** argv)
                                 " net_be=" + BytesToHex(nt_be));
                         auto block = BuildBlock(job, nonce, coinbase);
                         auto block_hex = BytesToHex(block);
+                        if (block.size() < 80) {
+                            LogLine("submit abort: built block shorter than 80 bytes");
+                            continue;
+                        }
+                        std::vector<uint8_t> h80_submit(block.begin(), block.begin() + 80);
                         const uint32_t id = submit_id.fetch_add(1);
+                        LogLine(std::string("step4:submit-mining-submit id=") + std::to_string(id) + " job=" + job.id +
+                                " nonce=" + std::to_string(nonce) +
+                                " header80=" + BytesToHex(h80_submit) +
+                                " block_hex=" + block_hex);
                         std::ostringstream req;
                         req << "{\"id\":" << id << ",\"method\":\"mining.submit\",\"params\":[\""
                             << cfg.wallet << "." << cfg.worker << "\",\"" << block_hex << "\",\"" << job.id << "\"]}";
-                        LogLine("step4:submit-mining-submit id=" + std::to_string(id));
+                        LogLine("step5:mining-submit-sent id=" + std::to_string(id));
                         send_json(req.str());
                     }
                     if ((nonce & 0x3fff) == 0) {
