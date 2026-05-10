@@ -19,13 +19,28 @@ add_executable(byze-miner
   src/main.cpp
 )
 
+add_executable(byze-rxhash
+  src/byze_rxhash.cpp
+)
+
 target_include_directories(byze-miner PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/randomx/src"
+)
+
+target_include_directories(byze-rxhash PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party/randomx/src"
 )
 
 target_link_libraries(byze-miner PRIVATE
   Boost::system
   OpenSSL::Crypto
+  Threads::Threads
+  randomx
+)
+
+target_compile_definitions(byze-miner PRIVATE BOOST_BIND_GLOBAL_PLACEHOLDERS)
+
+target_link_libraries(byze-rxhash PRIVATE
   Threads::Threads
   randomx
 )
