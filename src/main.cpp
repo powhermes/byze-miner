@@ -91,6 +91,8 @@ struct Config {
     int threads{0};
     /** 0 = use pool mining.set_difficulty only; else override until server sends difficulty. */
     uint32_t pool_difficulty_override{0};
+    uint32_t reconnect_delay_seconds{5};
+    uint32_t max_reconnect_delay_seconds{30};
 };
 
 struct Job {
@@ -301,7 +303,7 @@ uint32_t ParseBits(const std::string& bits_hex)
 struct MinerState {
     std::mutex mtx;
     std::optional<Job> job;
-    std::atomic<bool> running{true};
+    std::atomic<bool> running{true}; // whole-process running
     std::atomic<bool> has_job{false};
     std::atomic<uint64_t> hashes{0};
     std::atomic<uint64_t> accepted{0};
@@ -343,9 +345,12 @@ int main(int argc, char** argv)
         else if (a == "--worker" && i + 1 < argc) cfg.worker = argv[++i];
         else if (a == "--threads" && i + 1 < argc) cfg.threads = std::stoi(argv[++i]);
         else if (a == "--pool-difficulty" && i + 1 < argc) cfg.pool_difficulty_override = static_cast<uint32_t>(std::stoul(argv[++i]));
+        else if (a == "--reconnect-delay" && i + 1 < argc) cfg.reconnect_delay_seconds = static_cast<uint32_t>(std::stoul(argv[++i]));
+        else if (a == "--max-reconnect-delay" && i + 1 < argc) cfg.max_reconnect_delay_seconds = static_cast<uint32_t>(std::stoul(argv[++i]));
     }
     if (cfg.host.empty() || cfg.wallet.empty()) {
-        std::cerr << "Usage: byze-miner --pool host:port --wallet ADDRESS [--worker name] [--threads N] [--pool-difficulty N]\n";
+        std::cerr << "Usage: byze-miner --pool host:port --wallet ADDRESS [--worker name] [--threads N] "
+                     "[--pool-difficulty N] [--reconnect-delay S] [--max-reconnect-delay S]\n";
         return 1;
     }
     if (cfg.worker.empty()) cfg.worker = "cpu0";
@@ -368,180 +373,269 @@ int main(int argc, char** argv)
 
     MinerState state;
     if (cfg.pool_difficulty_override >= 1) state.pool_difficulty.store(cfg.pool_difficulty_override);
-    boost::asio::io_context io;
-    tcp::resolver resolver(io);
-    tcp::socket socket(io);
-    boost::asio::connect(socket, resolver.resolve(cfg.host, cfg.port));
+    std::atomic<uint32_t> submit_id{1000};
 
-    std::mutex send_mtx;
-    auto send_json = [&](const std::string& s) {
-        std::lock_guard<std::mutex> lk(send_mtx);
-        boost::asio::write(socket, boost::asio::buffer(s + "\n"));
+    auto clear_job = [&] {
+        std::lock_guard<std::mutex> g(state.mtx);
+        state.job.reset();
+        state.has_job.store(false);
     };
 
-    send_json(R"({"id":1,"method":"mining.subscribe","params":["byze-miner/0.1"]})");
-    send_json(std::string(R"({"id":2,"method":"mining.authorize","params":[")") + cfg.wallet + "." + cfg.worker + R"(","x"]})");
+    const uint32_t base_delay = std::max<uint32_t>(1, cfg.reconnect_delay_seconds);
+    const uint32_t max_delay = std::max<uint32_t>(base_delay, cfg.max_reconnect_delay_seconds);
+    uint32_t delay = base_delay;
 
-    std::thread reader([&] {
-        boost::asio::streambuf buf;
-        while (state.running.load()) {
-            boost::system::error_code ec;
-            boost::asio::read_until(socket, buf, '\n', ec);
-            if (ec) break;
-            std::istream is(&buf);
-            std::string line;
-            std::getline(is, line);
-            if (line.empty()) continue;
-            std::stringstream js(line);
-            ptree root;
-            try { read_json(js, root); } catch (...) { continue; }
+    while (state.running.load()) {
+        std::unique_ptr<boost::asio::io_context> io;
+        std::unique_ptr<tcp::socket> socket;
+        std::unique_ptr<tcp::resolver> resolver;
+        std::thread reader;
+        std::thread stats;
+        std::vector<std::thread> miners;
+        std::mutex send_mtx;
+        std::atomic<bool> session_running{true};
 
-            if (root.get_optional<std::string>("method") && root.get<std::string>("method") == "mining.set_difficulty") {
-                if (!cfg.pool_difficulty_override) {
+        auto close_socket = [&] {
+            session_running.store(false);
+            try {
+                if (socket && socket->is_open()) {
+                    boost::system::error_code ec;
+                    socket->shutdown(tcp::socket::shutdown_both, ec);
+                    socket->close(ec);
+                }
+            } catch (...) {
+            }
+        };
+
+        try {
+            io = std::make_unique<boost::asio::io_context>();
+            resolver = std::make_unique<tcp::resolver>(*io);
+            socket = std::make_unique<tcp::socket>(*io);
+
+            boost::asio::connect(*socket, resolver->resolve(cfg.host, cfg.port));
+
+            auto send_json = [&](const std::string& s) {
+                std::lock_guard<std::mutex> lk(send_mtx);
+                boost::asio::write(*socket, boost::asio::buffer(s + "\n"));
+            };
+
+            // (re)subscribe + authorize
+            send_json(R"({"id":1,"method":"mining.subscribe","params":["byze-miner/0.1"]})");
+            send_json(std::string(R"({"id":2,"method":"mining.authorize","params":[")") + cfg.wallet + "." + cfg.worker +
+                      R"(","x"]})");
+
+            LogLine("reconnect successful");
+            delay = base_delay; // reset backoff after a successful connect
+
+            reader = std::thread([&] {
+                boost::asio::streambuf buf;
+                while (state.running.load() && session_running.load()) {
+                    boost::system::error_code ec;
+                    boost::asio::read_until(*socket, buf, '\n', ec);
+                    if (ec) {
+                        break;
+                    }
+                    std::istream is(&buf);
+                    std::string line;
+                    std::getline(is, line);
+                    if (line.empty()) continue;
+                    std::stringstream js(line);
+                    ptree root;
                     try {
-                        auto params = root.get_child("params");
-                        auto pit = params.begin();
-                        if (pit != params.end()) {
-                            const double d = pit->second.get_value<double>(1024.0);
-                            uint32_t m = static_cast<uint32_t>(d);
-                            if (m < 1) m = 1;
-                            state.pool_difficulty.store(m);
-                        }
+                        read_json(js, root);
                     } catch (...) {
+                        continue;
                     }
-                }
-                continue;
-            }
-            if (root.get_optional<std::string>("method") && root.get<std::string>("method") == "mining.notify") {
-                auto params = root.get_child("params");
-                Job j;
-                auto it = params.begin();
-                if (it == params.end()) continue;
-                j.id = it->second.get_value<std::string>();
-                ++it;
-                if (it == params.end()) continue;
-                auto obj = it->second;
-                j.version = obj.get<uint32_t>("template.version");
-                j.prevhash = ToArray32LE(obj.get<std::string>("previousblockhash"));
-                j.bits = ParseBits(obj.get<std::string>("bits"));
-                j.curtime = obj.get<uint32_t>("curtime");
-                j.mintime = obj.get<uint32_t>("template.mintime", j.curtime);
-                j.coinbase_value = obj.get<uint64_t>("template.coinbasevalue");
-                j.height = obj.get<uint32_t>("height");
-                j.target = ToArray32LE(obj.get<std::string>("target"));
-                auto tbytes = HexToBytes(obj.get<std::string>("target"));
-                if (tbytes.size() == 32) {
-                    for (size_t k = 0; k < 32; ++k) j.target_be[k] = tbytes[k];
-                }
-                {
-                    std::lock_guard<std::mutex> g(state.mtx);
-                    state.job = j;
-                }
-                state.has_job.store(true);
-            } else {
-                const auto rid = PtreeJsonInt(root, "id");
-                if (rid && *rid >= 1000) {
-                    const bool ok = PtreeJsonResultOk(root) && !PtreeJsonErrorPresent(root);
-                    if (ok) state.accepted.fetch_add(1);
-                    else state.rejected.fetch_add(1);
-                }
-            }
-        }
-        state.running.store(false);
-    });
 
-    std::atomic<uint32_t> submit_id{1000};
-    std::vector<std::thread> miners;
-    for (int t = 0; t < cfg.threads; ++t) {
-        miners.emplace_back([&, t] {
-            while (state.running.load()) {
-                if (!state.has_job.load()) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); continue; }
-                Job job;
-                {
-                    std::lock_guard<std::mutex> g(state.mtx);
-                    if (!state.job.has_value()) continue;
-                    job = *state.job;
-                }
-                auto coinbase = BuildCoinbaseTx(job, cfg.worker);
-                LogLine("step1:block-candidate-built job=" + job.id + " height=" + std::to_string(job.height));
-                for (uint32_t nonce = static_cast<uint32_t>(t); state.running.load(); nonce += static_cast<uint32_t>(cfg.threads)) {
-                    std::array<uint8_t, 80> hdr{};
-                    std::memcpy(hdr.data(), &job.version, 4);
-                    std::memcpy(hdr.data() + 4, job.prevhash.data(), 32);
-                    auto cb_hash = Sha256d(coinbase.no_witness);
-                    std::memcpy(hdr.data() + 36, cb_hash.data(), 32);
-                    std::memcpy(hdr.data() + 68, &job.curtime, 4);
-                    std::memcpy(hdr.data() + 72, &job.bits, 4);
-                    std::memcpy(hdr.data() + 76, &nonce, 4);
-                    uint8_t hash[32];
-                    randomx_calculate_hash(vms[t], hdr.data(), hdr.size(), hash);
-                    if ((nonce & 0x3ffff) == 0) {
-                        LogLine("step2:randomx-hashing job=" + job.id + " thread=" + std::to_string(t));
+                    if (root.get_optional<std::string>("method") &&
+                        root.get<std::string>("method") == "mining.set_difficulty") {
+                        if (!cfg.pool_difficulty_override) {
+                            try {
+                                auto params = root.get_child("params");
+                                auto pit = params.begin();
+                                if (pit != params.end()) {
+                                    const double d = pit->second.get_value<double>(1024.0);
+                                    uint32_t m = static_cast<uint32_t>(d);
+                                    if (m < 1) m = 1;
+                                    state.pool_difficulty.store(m);
+                                }
+                            } catch (...) {
+                            }
+                        }
+                        continue;
                     }
-                    state.hashes.fetch_add(1, std::memory_order_relaxed);
-                    const uint32_t pd = state.pool_difficulty.load(std::memory_order_relaxed);
-                    std::array<uint8_t, 32> share_le{};
-                    std::array<uint8_t, 32> share_be{};
-                    ShareTargetsFromNetwork(job.target, pd, share_le, share_be);
-                    const bool hit_share = HashMeetsTargetLE(hash, share_le) || HashMeetsTargetBE(hash, share_be);
-                    const bool hit_block = HashMeetsTargetLE(hash, job.target) || HashMeetsTargetBE(hash, job.target_be);
-                    if (hit_share) {
-                        std::vector<uint8_t> hv(hash, hash + 32);
-                        std::vector<uint8_t> hv_rev(hv.rbegin(), hv.rend());
-                        std::vector<uint8_t> st_le(share_le.begin(), share_le.end());
-                        std::vector<uint8_t> st_be(share_be.begin(), share_be.end());
-                        std::vector<uint8_t> nt_be(job.target_be.begin(), job.target_be.end());
-                        LogLine(std::string("step3:valid-share-detected job=") + job.id + " nonce=" + std::to_string(nonce) +
-                                (hit_block ? " kind=block" : " kind=pool_share") +
-                                " pdiff=" + std::to_string(pd) +
-                                " hash=" + BytesToHex(hv) +
-                                " hash_rev=" + BytesToHex(hv_rev) +
-                                " share_le=" + BytesToHex(st_le) +
-                                " share_be=" + BytesToHex(st_be) +
-                                " net_be=" + BytesToHex(nt_be));
-                        auto block = BuildBlock(job, nonce, coinbase);
-                        auto block_hex = BytesToHex(block);
-                        if (block.size() < 80) {
-                            LogLine("submit abort: built block shorter than 80 bytes");
+                    if (root.get_optional<std::string>("method") && root.get<std::string>("method") == "mining.notify") {
+                        auto params = root.get_child("params");
+                        Job j;
+                        auto it = params.begin();
+                        if (it == params.end()) continue;
+                        j.id = it->second.get_value<std::string>();
+                        ++it;
+                        if (it == params.end()) continue;
+                        auto obj = it->second;
+                        j.version = obj.get<uint32_t>("template.version");
+                        j.prevhash = ToArray32LE(obj.get<std::string>("previousblockhash"));
+                        j.bits = ParseBits(obj.get<std::string>("bits"));
+                        j.curtime = obj.get<uint32_t>("curtime");
+                        j.mintime = obj.get<uint32_t>("template.mintime", j.curtime);
+                        j.coinbase_value = obj.get<uint64_t>("template.coinbasevalue");
+                        j.height = obj.get<uint32_t>("height");
+                        j.target = ToArray32LE(obj.get<std::string>("target"));
+                        auto tbytes = HexToBytes(obj.get<std::string>("target"));
+                        if (tbytes.size() == 32) {
+                            for (size_t k = 0; k < 32; ++k) j.target_be[k] = tbytes[k];
+                        }
+                        {
+                            std::lock_guard<std::mutex> g(state.mtx);
+                            state.job = j;
+                        }
+                        state.has_job.store(true);
+                    } else {
+                        const auto rid = PtreeJsonInt(root, "id");
+                        if (rid && *rid >= 1000) {
+                            const bool ok = PtreeJsonResultOk(root) && !PtreeJsonErrorPresent(root);
+                            if (ok) state.accepted.fetch_add(1);
+                            else state.rejected.fetch_add(1);
+                        }
+                    }
+                }
+                // Force teardown; worker threads will observe session_running=false and/or job cleared.
+                session_running.store(false);
+            });
+
+            stats = std::thread([&] {
+                uint64_t last = 0;
+                while (state.running.load()) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    uint64_t now = state.hashes.load();
+                    uint64_t hps = now - last;
+                    last = now;
+                    LogLine("hashrate=" + std::to_string(hps) + " H/s accepted=" + std::to_string(state.accepted.load()) +
+                            " rejected=" + std::to_string(state.rejected.load()));
+                }
+            });
+
+            miners.reserve(cfg.threads);
+            for (int t = 0; t < cfg.threads; ++t) {
+                miners.emplace_back([&, t] {
+                    while (state.running.load() && session_running.load()) {
+                        if (!state.has_job.load()) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
                             continue;
                         }
-                        std::vector<uint8_t> h80_submit(block.begin(), block.begin() + 80);
-                        const uint32_t id = submit_id.fetch_add(1);
-                        LogLine(std::string("step4:submit-mining-submit id=") + std::to_string(id) + " job=" + job.id +
-                                " nonce=" + std::to_string(nonce) +
-                                " header80=" + BytesToHex(h80_submit) +
-                                " block_hex=" + block_hex);
-                        std::ostringstream req;
-                        req << "{\"id\":" << id << ",\"method\":\"mining.submit\",\"params\":[\""
-                            << cfg.wallet << "." << cfg.worker << "\",\"" << block_hex << "\",\"" << job.id << "\"]}";
-                        LogLine("step5:mining-submit-sent id=" + std::to_string(id));
-                        send_json(req.str());
+                        Job job;
+                        {
+                            std::lock_guard<std::mutex> g(state.mtx);
+                            if (!state.job.has_value()) continue;
+                            job = *state.job;
+                        }
+                        auto coinbase = BuildCoinbaseTx(job, cfg.worker);
+                        LogLine("step1:block-candidate-built job=" + job.id + " height=" + std::to_string(job.height));
+                        for (uint32_t nonce = static_cast<uint32_t>(t); state.running.load() && session_running.load();
+                             nonce += static_cast<uint32_t>(cfg.threads)) {
+                            std::array<uint8_t, 80> hdr{};
+                            std::memcpy(hdr.data(), &job.version, 4);
+                            std::memcpy(hdr.data() + 4, job.prevhash.data(), 32);
+                            auto cb_hash = Sha256d(coinbase.no_witness);
+                            std::memcpy(hdr.data() + 36, cb_hash.data(), 32);
+                            std::memcpy(hdr.data() + 68, &job.curtime, 4);
+                            std::memcpy(hdr.data() + 72, &job.bits, 4);
+                            std::memcpy(hdr.data() + 76, &nonce, 4);
+                            uint8_t hash[32];
+                            randomx_calculate_hash(vms[t], hdr.data(), hdr.size(), hash);
+                            if ((nonce & 0x3ffff) == 0) {
+                                LogLine("step2:randomx-hashing job=" + job.id + " thread=" + std::to_string(t));
+                            }
+                            state.hashes.fetch_add(1, std::memory_order_relaxed);
+                            const uint32_t pd = state.pool_difficulty.load(std::memory_order_relaxed);
+                            std::array<uint8_t, 32> share_le{};
+                            std::array<uint8_t, 32> share_be{};
+                            ShareTargetsFromNetwork(job.target, pd, share_le, share_be);
+                            const bool hit_share = HashMeetsTargetLE(hash, share_le) || HashMeetsTargetBE(hash, share_be);
+                            const bool hit_block = HashMeetsTargetLE(hash, job.target) || HashMeetsTargetBE(hash, job.target_be);
+                            if (hit_share) {
+                                std::vector<uint8_t> hv(hash, hash + 32);
+                                std::vector<uint8_t> hv_rev(hv.rbegin(), hv.rend());
+                                std::vector<uint8_t> st_le(share_le.begin(), share_le.end());
+                                std::vector<uint8_t> st_be(share_be.begin(), share_be.end());
+                                std::vector<uint8_t> nt_be(job.target_be.begin(), job.target_be.end());
+                                LogLine(std::string("step3:valid-share-detected job=") + job.id + " nonce=" + std::to_string(nonce) +
+                                        (hit_block ? " kind=block" : " kind=pool_share") + " pdiff=" + std::to_string(pd) +
+                                        " hash=" + BytesToHex(hv) + " hash_rev=" + BytesToHex(hv_rev) +
+                                        " share_le=" + BytesToHex(st_le) + " share_be=" + BytesToHex(st_be) +
+                                        " net_be=" + BytesToHex(nt_be));
+                                auto block = BuildBlock(job, nonce, coinbase);
+                                auto block_hex = BytesToHex(block);
+                                if (block.size() < 80) {
+                                    LogLine("submit abort: built block shorter than 80 bytes");
+                                } else {
+                                    std::vector<uint8_t> h80_submit(block.begin(), block.begin() + 80);
+                                    const uint32_t id = submit_id.fetch_add(1);
+                                    LogLine(std::string("step4:submit-mining-submit id=") + std::to_string(id) + " job=" +
+                                            job.id + " nonce=" + std::to_string(nonce) + " header80=" +
+                                            BytesToHex(h80_submit) + " block_hex=" + block_hex);
+                                    std::ostringstream req;
+                                    req << "{\"id\":" << id << ",\"method\":\"mining.submit\",\"params\":[\""
+                                        << cfg.wallet << "." << cfg.worker << "\",\"" << block_hex << "\",\"" << job.id
+                                        << "\"]}";
+                                    try {
+                                        send_json(req.str());
+                                        LogLine("step5:mining-submit-sent id=" + std::to_string(id));
+                                    } catch (...) {
+                                        // Any write error triggers reconnect by tearing down the session.
+                                        session_running.store(false);
+                                        close_socket();
+                                        break;
+                                    }
+                                }
+                            }
+                            if ((nonce & 0x3fff) == 0) {
+                                std::lock_guard<std::mutex> g(state.mtx);
+                                if (!state.job || state.job->id != job.id) break;
+                            }
+                        }
                     }
-                    if ((nonce & 0x3fff) == 0) {
-                        std::lock_guard<std::mutex> g(state.mtx);
-                        if (!state.job || state.job->id != job.id) break;
-                    }
-                }
+                });
             }
-        });
-    }
 
-    std::thread stats([&] {
-        uint64_t last = 0;
-        while (state.running.load()) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            uint64_t now = state.hashes.load();
-            uint64_t hps = now - last;
-            last = now;
-            LogLine("hashrate=" + std::to_string(hps) + " H/s accepted=" + std::to_string(state.accepted.load()) +
-                    " rejected=" + std::to_string(state.rejected.load()));
+            // Wait for reader to finish (EOF/pool restart/read error)
+            if (reader.joinable()) reader.join();
+
+            // Tear down this session.
+            close_socket();
+            clear_job();
+            for (auto& t : miners) if (t.joinable()) t.join();
+            // stats thread is process-lifetime; stop only when state.running is false
+            if (stats.joinable()) stats.detach();
+
+            // reconnect loop continues
+            if (!state.running.load()) break;
+            LogLine("pool disconnected, reconnecting in " + std::to_string(delay) + "s");
+            std::this_thread::sleep_for(std::chrono::seconds(delay));
+            delay = std::min<uint32_t>(max_delay, delay + base_delay);
+            continue;
+        } catch (const boost::system::system_error& e) {
+            close_socket();
+            clear_job();
+            for (auto& t : miners) if (t.joinable()) t.join();
+            if (reader.joinable()) reader.join();
+            if (!state.running.load()) break;
+            LogLine(std::string("pool disconnected, reconnecting in ") + std::to_string(delay) + "s");
+            std::this_thread::sleep_for(std::chrono::seconds(delay));
+            delay = std::min<uint32_t>(max_delay, delay + base_delay);
+            continue;
+        } catch (const std::exception& e) {
+            close_socket();
+            clear_job();
+            for (auto& t : miners) if (t.joinable()) t.join();
+            if (reader.joinable()) reader.join();
+            if (!state.running.load()) break;
+            LogLine(std::string("pool disconnected, reconnecting in ") + std::to_string(delay) + "s");
+            std::this_thread::sleep_for(std::chrono::seconds(delay));
+            delay = std::min<uint32_t>(max_delay, delay + base_delay);
+            continue;
         }
-    });
-
-    reader.join();
-    state.running.store(false);
-    for (auto& t : miners) if (t.joinable()) t.join();
-    if (stats.joinable()) stats.join();
+    }
 
     for (auto* vm : vms) randomx_destroy_vm(vm);
     randomx_release_dataset(dataset);
