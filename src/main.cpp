@@ -325,6 +325,12 @@ std::vector<uint8_t> BuildBlock(const Job& job, uint32_t nonce, const CoinbaseTx
     WriteLE32(block, nonce);
     WriteVarInt(block, 1);
     block.insert(block.end(), coinbase.with_witness.begin(), coinbase.with_witness.end());
+    // Byze CBlock wire format: header + vtx + quantum_signature_data (primitives/block.h).
+    // DecodeHexBlk deserializes with TX_WITH_WITNESS; missing tail causes RPC "Block decode failed".
+    // Empty vectors = CompactSize(0); same encoding as WriteVarInt(0) for values < 0xfd.
+    WriteVarInt(block, 0); // xmss_signature
+    WriteVarInt(block, 0); // sphincs_signature
+    WriteVarInt(block, 0); // dual_public_key
     return block;
 }
 
