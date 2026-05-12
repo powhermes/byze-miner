@@ -554,12 +554,19 @@ int main(int argc, char** argv)
                             const bool hit_share = HashMeetsTargetLE(hash, share_le) || HashMeetsTargetBE(hash, share_be);
                             const bool hit_block = HashMeetsTargetLE(hash, job.target) || HashMeetsTargetBE(hash, job.target_be);
                             if (hit_share) {
+                                if (hit_block) {
+                                    LogLine(std::string("network-target-hit job=") + job.id + " nonce=" + std::to_string(nonce) +
+                                            " pdiff=" + std::to_string(pd));
+                                } else {
+                                    LogLine(std::string("share-target-hit job=") + job.id + " nonce=" + std::to_string(nonce) +
+                                            " pdiff=" + std::to_string(pd));
+                                }
                                 std::vector<uint8_t> hv(hash, hash + 32);
                                 std::vector<uint8_t> hv_rev(hv.rbegin(), hv.rend());
                                 std::vector<uint8_t> st_le(share_le.begin(), share_le.end());
                                 std::vector<uint8_t> st_be(share_be.begin(), share_be.end());
                                 std::vector<uint8_t> nt_be(job.target_be.begin(), job.target_be.end());
-                                LogLine(std::string("step3:valid-share-detected job=") + job.id + " nonce=" + std::to_string(nonce) +
+                                LogLine(std::string("step3:submit-candidate job=") + job.id + " nonce=" + std::to_string(nonce) +
                                         (hit_block ? " kind=block" : " kind=pool_share") + " pdiff=" + std::to_string(pd) +
                                         " hash=" + BytesToHex(hv) + " hash_rev=" + BytesToHex(hv_rev) +
                                         " share_le=" + BytesToHex(st_le) + " share_be=" + BytesToHex(st_be) +
