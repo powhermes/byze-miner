@@ -106,6 +106,11 @@ struct Job {
     uint32_t height{0};
     std::array<uint8_t, 32> target{};
     std::array<uint8_t, 32> target_be{};
+    /**
+     * When true, pool GBT template included the "segwit" rule (witness commitment / witness serialization).
+     * Must match consensus for the active chain; height check below uses Byze mainnet buried deployment.
+     */
+    bool gbt_segwit_rule{false};
 };
 
 struct ShareSubmitResult {
@@ -168,6 +173,19 @@ struct CoinbaseTx {
     std::vector<uint8_t> with_witness;
     std::vector<uint8_t> no_witness;
 };
+
+/**
+ * Buried SegWit activation height on Byze mainnet (see consensus.SegwitHeight in
+ * byze/src/kernel/chainparams.cpp). Below this height vtx must not carry witness serialization
+ * (no 0001 flag) or the node rejects the block with unexpected-witness.
+ */
+constexpr int BYZE_MAINNET_SEGWIT_HEIGHT = 481824;
+
+bool UseWitnessCoinbaseSerialization(const Job& job)
+{
+    if (static_cast<int>(job.height) >= BYZE_MAINNET_SEGWIT_HEIGHT) return true;
+    return job.gbt_segwit_rule;
+}
 
 CoinbaseTx BuildCoinbaseTx(const Job& job, const std::string& worker)
 {
@@ -318,13 +336,16 @@ std::vector<uint8_t> BuildBlock(const Job& job, uint32_t nonce, const CoinbaseTx
     block.reserve(2048);
     WriteLE32(block, job.version);
     block.insert(block.end(), job.prevhash.begin(), job.prevhash.end());
+    // Header merkle uses BIP141 txid (non-witness serialization) for every tx, including post-SegWit coinbase.
     auto cb_hash = Sha256d(coinbase.no_witness);
     block.insert(block.end(), cb_hash.begin(), cb_hash.end()); // merkle root, only coinbase
     WriteLE32(block, job.curtime);
     WriteLE32(block, job.bits);
     WriteLE32(block, nonce);
     WriteVarInt(block, 1);
-    block.insert(block.end(), coinbase.with_witness.begin(), coinbase.with_witness.end());
+    const bool wit = UseWitnessCoinbaseSerialization(job);
+    const std::vector<uint8_t>& vtx_cb = wit ? coinbase.with_witness : coinbase.no_witness;
+    block.insert(block.end(), vtx_cb.begin(), vtx_cb.end());
     // Byze CBlock wire format: header + vtx + quantum_signature_data (primitives/block.h).
     // DecodeHexBlk deserializes with TX_WITH_WITNESS; missing tail causes RPC "Block decode failed".
     // Empty vectors = CompactSize(0); same encoding as WriteVarInt(0) for values < 0xfd.
@@ -486,6 +507,16 @@ int main(int argc, char** argv)
                         j.mintime = obj.get<uint32_t>("template.mintime", j.curtime);
                         j.coinbase_value = obj.get<uint64_t>("template.coinbasevalue");
                         j.height = obj.get<uint32_t>("height");
+                        j.gbt_segwit_rule = false;
+                        if (const auto rules = obj.get_child_optional("template.rules")) {
+                            for (const auto& ent : *rules) {
+                                const std::string s = ent.second.get_value<std::string>(ent.second.data());
+                                if (s == "segwit") {
+                                    j.gbt_segwit_rule = true;
+                                    break;
+                                }
+                            }
+                        }
                         j.target = ToArray32LE(obj.get<std::string>("target"));
                         auto tbytes = HexToBytes(obj.get<std::string>("target"));
                         if (tbytes.size() == 32) {
