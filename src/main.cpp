@@ -161,6 +161,49 @@ void WriteVarInt(std::vector<uint8_t>& out, uint64_t v)
     else { out.push_back(0xfe); WriteLE32(out, static_cast<uint32_t>(v)); }
 }
 
+/** Bitcoin CScriptNum minimal serialization (matches byze/src/script/script.h). */
+std::vector<uint8_t> SerializeScriptNum(int64_t value)
+{
+    if (value == 0) return {};
+    std::vector<uint8_t> result;
+    const bool neg = value < 0;
+    uint64_t absvalue = neg ? static_cast<uint64_t>(-(value + 1)) + 1 : static_cast<uint64_t>(value);
+    while (absvalue) {
+        result.push_back(absvalue & 0xff);
+        absvalue >>= 8;
+    }
+    if (result.back() & 0x80)
+        result.push_back(neg ? 0x80 : 0);
+    else if (neg)
+        result.back() |= 0x80;
+    return result;
+}
+
+/** BIP34 height push matching CScript::push_int64. */
+void AppendCoinbaseHeight(std::vector<uint8_t>& scriptsig, int64_t height)
+{
+    if (height == 0) {
+        scriptsig.push_back(0x00);
+        return;
+    }
+    if (height >= 1 && height <= 16) {
+        scriptsig.push_back(static_cast<uint8_t>(0x50 + height));
+        return;
+    }
+    const auto num = SerializeScriptNum(height);
+    if (num.size() < 0x4c) {
+        scriptsig.push_back(static_cast<uint8_t>(num.size()));
+    } else if (num.size() <= 0xff) {
+        scriptsig.push_back(0x4c);
+        scriptsig.push_back(static_cast<uint8_t>(num.size()));
+    } else {
+        scriptsig.push_back(0x4d);
+        scriptsig.push_back(num.size() & 0xff);
+        scriptsig.push_back((num.size() >> 8) & 0xff);
+    }
+    scriptsig.insert(scriptsig.end(), num.begin(), num.end());
+}
+
 std::vector<uint8_t> Sha256d(const std::vector<uint8_t>& data)
 {
     std::vector<uint8_t> h1(SHA256_DIGEST_LENGTH), h2(SHA256_DIGEST_LENGTH);
@@ -179,7 +222,7 @@ struct CoinbaseTx {
  * byze/src/kernel/chainparams.cpp). Below this height vtx must not carry witness serialization
  * (no 0001 flag) or the node rejects the block with unexpected-witness.
  */
-constexpr int BYZE_MAINNET_SEGWIT_HEIGHT = 481824;
+constexpr int BYZE_MAINNET_SEGWIT_HEIGHT = 1;
 
 bool UseWitnessCoinbaseSerialization(const Job& job)
 {
@@ -204,10 +247,7 @@ CoinbaseTx BuildCoinbaseTx(const Job& job, const std::string& worker)
     WriteLE32(txnw, 0xffffffff);
 
     std::vector<uint8_t> scriptsig;
-    scriptsig.push_back(0x03);
-    scriptsig.push_back(job.height & 0xff);
-    scriptsig.push_back((job.height >> 8) & 0xff);
-    scriptsig.push_back((job.height >> 16) & 0xff);
+    AppendCoinbaseHeight(scriptsig, static_cast<int64_t>(job.height));
     const std::string tag = "/byze-miner/" + worker + "/";
     scriptsig.push_back(static_cast<uint8_t>(std::min<size_t>(tag.size(), 60)));
     scriptsig.insert(scriptsig.end(), tag.begin(), tag.begin() + std::min<size_t>(tag.size(), 60));
