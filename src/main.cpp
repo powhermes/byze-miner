@@ -361,11 +361,14 @@ uint32_t ParseBits(const std::string& bits_hex)
 struct MinerState {
     std::mutex mtx;
     std::optional<Job> job;
+    /** Incremented on each mining.notify so workers drop stale work immediately. */
+    std::atomic<uint64_t> job_epoch{0};
     std::atomic<bool> running{true}; // whole-process running
     std::atomic<bool> has_job{false};
     std::atomic<uint64_t> hashes{0};
     std::atomic<uint64_t> accepted{0};
     std::atomic<uint64_t> rejected{0};
+    std::atomic<uint64_t> dropped_stale{0};
     /** Stratum mining.set_difficulty (truncated to uint32, min 1). Default 1024 matches typical pool. */
     std::atomic<uint32_t> pool_difficulty{1024};
 };
@@ -565,6 +568,7 @@ int main(int argc, char** argv)
                         {
                             std::lock_guard<std::mutex> g(state.mtx);
                             state.job = j;
+                            state.job_epoch.fetch_add(1, std::memory_order_release);
                         }
                         state.has_job.store(true);
                     } else {
@@ -588,7 +592,8 @@ int main(int argc, char** argv)
                     uint64_t hps = now - last;
                     last = now;
                     LogLine("hashrate=" + std::to_string(hps) + " H/s accepted=" + std::to_string(state.accepted.load()) +
-                            " rejected=" + std::to_string(state.rejected.load()));
+                            " rejected=" + std::to_string(state.rejected.load()) +
+                            " dropped_stale=" + std::to_string(state.dropped_stale.load()));
                 }
             });
 
@@ -601,15 +606,18 @@ int main(int argc, char** argv)
                             continue;
                         }
                         Job job;
+                        uint64_t work_epoch{0};
                         {
                             std::lock_guard<std::mutex> g(state.mtx);
                             if (!state.job.has_value()) continue;
                             job = *state.job;
+                            work_epoch = state.job_epoch.load(std::memory_order_acquire);
                         }
                         auto coinbase = BuildCoinbaseTx(job, cfg.worker);
                         LogLine("step1:block-candidate-built job=" + job.id + " height=" + std::to_string(job.height));
                         for (uint32_t nonce = static_cast<uint32_t>(t); state.running.load() && session_running.load();
                              nonce += static_cast<uint32_t>(cfg.threads)) {
+                            if (state.job_epoch.load(std::memory_order_acquire) != work_epoch) break;
                             std::array<uint8_t, 80> hdr{};
                             std::memcpy(hdr.data(), &job.version, 4);
                             std::memcpy(hdr.data() + 4, job.prevhash.data(), 32);
@@ -631,6 +639,10 @@ int main(int argc, char** argv)
                             const bool hit_share = HashMeetsTargetLE(hash, share_le) || HashMeetsTargetBE(hash, share_be);
                             const bool hit_block = HashMeetsTargetLE(hash, job.target) || HashMeetsTargetBE(hash, job.target_be);
                             if (hit_share) {
+                                if (state.job_epoch.load(std::memory_order_acquire) != work_epoch) {
+                                    state.dropped_stale.fetch_add(1, std::memory_order_relaxed);
+                                    continue;
+                                }
                                 if (hit_block) {
                                     LogLine(std::string("network-target-hit job=") + job.id + " nonce=" + std::to_string(nonce) +
                                             " pdiff=" + std::to_string(pd));
@@ -673,9 +685,9 @@ int main(int argc, char** argv)
                                     }
                                 }
                             }
-                            if ((nonce & 0x3fff) == 0) {
-                                std::lock_guard<std::mutex> g(state.mtx);
-                                if (!state.job || state.job->id != job.id) break;
+                            if ((nonce & 0xff) == 0 &&
+                                state.job_epoch.load(std::memory_order_acquire) != work_epoch) {
+                                break;
                             }
                         }
                     }
