@@ -111,6 +111,8 @@ struct Job {
      * Must match consensus for the active chain; height check below uses Byze mainnet buried deployment.
      */
     bool gbt_segwit_rule{false};
+    /** Hex scriptPubKey for coinbase vout[0]; empty = legacy OP_1 (not poolwallet-spendable). */
+    std::string coinbase_script_hex;
 };
 
 struct ShareSubmitResult {
@@ -267,10 +269,14 @@ CoinbaseTx BuildCoinbaseTx(const Job& job, const std::string& worker)
     WriteVarInt(txnw, 2);
     WriteLE64(txw, job.coinbase_value);
     WriteLE64(txnw, job.coinbase_value);
-    txw.push_back(0x01);
-    txnw.push_back(0x01);
-    txw.push_back(0x51);
-    txnw.push_back(0x51);
+    std::vector<uint8_t> payout_script = HexToBytes(job.coinbase_script_hex);
+    if (payout_script.empty()) {
+        payout_script.push_back(0x51);
+    }
+    WriteVarInt(txw, payout_script.size());
+    WriteVarInt(txnw, payout_script.size());
+    txw.insert(txw.end(), payout_script.begin(), payout_script.end());
+    txnw.insert(txnw.end(), payout_script.begin(), payout_script.end());
 
     // OP_RETURN 0x24 aa21a9ed <32-byte-commitment>
     WriteLE64(txw, 0);
@@ -550,6 +556,7 @@ int main(int argc, char** argv)
                         j.mintime = obj.get<uint32_t>("template.mintime", j.curtime);
                         j.coinbase_value = obj.get<uint64_t>("template.coinbasevalue");
                         j.height = obj.get<uint32_t>("height");
+                        j.coinbase_script_hex = obj.get<std::string>("template.coinbasescript", "");
                         j.gbt_segwit_rule = false;
                         if (const auto rules = obj.get_child_optional("template.rules")) {
                             for (const auto& ent : *rules) {
